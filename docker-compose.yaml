@@ -1,0 +1,24 @@
+version: '3.9'
+services:
+    notion-tv:
+        image: allaboutduncan/notion-tv:latest
+        container_name: notion-tv
+        logging:
+            options:
+                max-size: 1g
+        restart: always
+        volumes:
+            - '/var/run/docker.sock:/tmp/docker.sock:ro'
+        ports:
+            - '3333:3333'
+        environment:
+            - USE_AWS=yes/no
+            - AWS_ACCESS_KEY_ID=ENTER-YOUR-ACCESS-KEY-HERE
+            - AWS_SECRET_ACCESS_KEY=ENTER-YOUR-SECRET-KEY-HERE
+            - AWS_BUCKET=bucket-name
+            - NOTION_TOKEN=notion_secret
+            - NOTION_DATABASE_ID=notion-database-id
+            - GoogleAPIKey=Google-Books-API-Key
+            - USE_PUSHOVER=yes/no
+            - PO_TOKEN=pushover-app-API-key
+            - PO_USER=pushover_user_key
