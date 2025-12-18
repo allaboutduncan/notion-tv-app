@@ -8,6 +8,7 @@ import logging
 import boto3
 from botocore.exceptions import ClientError
 import os
+import json
 from bs4 import BeautifulSoup
 from pushover import Pushover
 
@@ -15,6 +16,7 @@ from pushover import Pushover
 SERVICE_NAME = "Notion TV"
 NOTION_TOKEN = os.getenv("NOTION_TOKEN")
 DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
+TMDB_API_KEY = os.getenv("TMDB_API_KEY")
 
 USE_PUSHOVER = os.getenv("USE_PUSHOVER", "no")  # Default to 'no' if USE_PUSHOVER is not set
 USE_AWS = os.getenv("USE_AWS", "no")  # Default to 'no' if USE_AWS is not set
@@ -116,6 +118,37 @@ def get_seasons(tv_id):
         print(f"Error: {e}")
         return None
 
+def get_movie_by_name(movie_title):
+    """Search for a movie on TMDb API by name"""
+    base_url = f'https://api.themoviedb.org/3/search/movie?api_key={TMDB_API_KEY}&query={movie_title}'
+    try:
+        response = requests.get(base_url)
+        logging.info(f"TMDb API response: {response.status_code}")
+        response.raise_for_status()
+        data = response.json()
+        if data['results']:
+            movie_id = data['results'][0]['id']
+            return get_movie_by_id(movie_id)
+        else:
+            logging.warning(f"No movie found for '{movie_title}'")
+            return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error searching TMDb: {e}")
+        return None
+
+def get_movie_by_id(movie_id):
+    """Get detailed movie information from TMDb API by ID"""
+    base_url = f'https://api.themoviedb.org/3/movie/{movie_id}?api_key={TMDB_API_KEY}'
+    try:
+        response = requests.get(base_url)
+        response.raise_for_status()
+        movie_data = response.json()
+        logging.info(f"Found movie: {movie_data.get('title', 'Unknown')}")
+        return movie_data
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Error fetching movie details: {e}")
+        return None
+
 def get_pages(num_pages=None):
     """
     If num_pages is None, get all pages, otherwise just the defined number.
@@ -171,21 +204,40 @@ def read_pages():
          page_id = page["id"]
          props = page["properties"]
          title = props["Name"]["title"][0]["text"]["content"]
-         tvmazeID = props["tvmazeID"]["number"]
-         logging.info(f"Processing: {title} (tvmazeID: {tvmazeID})")
 
-         if tvmazeID is None:
-            logging.info(f"No tvmazeID found for '{title}', searching TVMaze API...")
-            new_tv_title = title.replace(';', '')
-            new_tv_title = new_tv_title.replace(' ', '+')
-            tv_data = get_tv_by_name(new_tv_title)
-            if tv_data:
-               logging.info(f"Found TV data for '{title}', updating Notion...")
-               update_tv_data(tv_data,page_id)
+         # Get Type field (Movie or TV Serie)
+         content_type = props.get("Type", {}).get("select", {}).get("name", "TV Serie")
+         logging.info(f"Processing: {title} (Type: {content_type})")
+
+         if content_type == "Movie":
+            # Handle movies with TMDb
+            tmdb_id = props.get("tmdbID", {}).get("number")
+            if tmdb_id is None:
+               logging.info(f"No tmdbID found for movie '{title}', searching TMDb API...")
+               search_title = title.replace(';', '').replace(' ', '+')
+               movie_data = get_movie_by_name(search_title)
+               if movie_data:
+                  logging.info(f"Found movie data for '{title}', updating Notion...")
+                  update_movie_data(movie_data, page_id)
+               else:
+                  logging.warning(f"Could not find movie '{title}' on TMDb")
             else:
-               logging.warning(f"Could not find TV data for '{title}' on TVMaze")
+               logging.info(f"Movie '{title}' already has tmdbID, skipping")
          else:
-            logging.info(f"Show '{title}' already has tvmazeID, skipping")
+            # Handle TV shows with TVMaze
+            tvmazeID = props.get("tvmazeID", {}).get("number")
+            if tvmazeID is None:
+               logging.info(f"No tvmazeID found for TV show '{title}', searching TVMaze API...")
+               new_tv_title = title.replace(';', '')
+               new_tv_title = new_tv_title.replace(' ', '+')
+               tv_data = get_tv_by_name(new_tv_title)
+               if tv_data:
+                  logging.info(f"Found TV data for '{title}', updating Notion...")
+                  update_tv_data(tv_data,page_id)
+               else:
+                  logging.warning(f"Could not find TV data for '{title}' on TVMaze")
+            else:
+               logging.info(f"Show '{title}' already has tvmazeID, skipping")
       except KeyError as e:
          logging.error(f"Error processing page {page.get('id', 'unknown')}: {e} key not found.")
          try:
@@ -206,17 +258,18 @@ def update_page(page_id: str, data: dict):
     print(payload)
     res = requests.patch(url, json=payload, headers=NOTION_headers)
     if res.status_code == 200:
-        print('Book details updated successfully!')
+        print('Details updated successfully!')
     else:
         print(f'Notion update request failed with status code: {res.status_code}')
-
-        json_data = json.loads(res.content.decode('utf-8'))
-        # Print key-value pairs
-        for key, value in json_data.items():
-          # print(f'{key}: {value}')
-          subject = json_data['status'],json_data['code']
-          message = json_data['message']
-          send_push(subject,message)
+        try:
+            json_data = res.json()
+            logging.error(f"Error response: {json_data}")
+            if USE_PUSHOVER.lower() == "yes":
+                subject = f"{json_data.get('status', 'Error')}: {json_data.get('code', 'Unknown')}"
+                message = json_data.get('message', 'No error message')
+                send_push(subject, message)
+        except Exception as e:
+            logging.error(f"Could not parse error response: {e}")
     return res
 
 def make_banner(img_url,page_id):
@@ -258,6 +311,110 @@ def make_banner(img_url,page_id):
       upload_file(img_name,img_name)
    # background.show()
    return background
+
+def update_movie_data(movie_data, page_id):
+      """Update Notion with movie data from TMDb"""
+      logging.info("Start Movie Update")
+
+      # Extract movie data
+      name = movie_data['title']
+      tmdb_id = movie_data['id']
+      status = movie_data.get('status', 'Released')
+      release_date = movie_data.get('release_date')
+      summary = movie_data.get('overview', '')
+      runtime = movie_data.get('runtime', 0)
+
+      # Get poster image
+      poster_path = movie_data.get('poster_path')
+      if poster_path:
+          img_url = f"https://image.tmdb.org/t/p/original{poster_path}"
+          make_banner(img_url, page_id)
+
+          if USE_AWS.lower() == "yes":
+              banner = f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{page_id}.jpg"
+              poster = f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{page_id}_poster.jpg"
+          else:
+              banner = img_url
+              poster = img_url
+      else:
+          banner = "https://upload.wikimedia.org/wikipedia/commons/c/ca/1x1.png"
+          poster = banner
+
+      # Prepare dates
+      premiered = {"start": release_date} if release_date else None
+
+      # Build Notion update
+      update_data = {
+          "cover": {
+              "external": {
+                  "url": banner
+              }
+          },
+          "properties": {
+              "tmdbID": {
+                  "number": tmdb_id
+              },
+              "Type": {
+                  "select": {
+                      "name": "Movie"
+                  }
+              },
+              "Show Status": {
+                  "select": {
+                      "name": status
+                  }
+              },
+              "Premiered": {
+                  "type": "date",
+                  "date": premiered
+              },
+              "Runtime": {
+                  "number": runtime
+              },
+              "Poster": {
+                  "type": "files",
+                  "files": [
+                      {
+                          "name": "Poster",
+                          "type": "external",
+                          "external": {
+                              "url": poster
+                          }
+                      }
+                  ]
+              },
+              "Summary": {
+                  "type": "rich_text",
+                  "rich_text": [
+                      {
+                          "type": "text",
+                          "text": {
+                              "content": summary[:2000]  # Notion has a 2000 char limit
+                          }
+                      }
+                  ]
+              },
+              "Name": {
+                  "type": "title",
+                  "title": [
+                      {
+                          "type": "text",
+                          "text": {
+                              "content": name
+                          }
+                      }
+                  ]
+              }
+          }
+      }
+
+      update_page(page_id, update_data)
+
+      # Cleanup
+      if os.path.exists(page_id+".jpg"):
+          os.remove(page_id+".jpg")
+      if os.path.exists(page_id+"_poster.jpg"):
+          os.remove(page_id+"_poster.jpg")
 
 def update_tv_data(tv_data,page_id):
       print("Start TV Update")
@@ -305,6 +462,11 @@ def update_tv_data(tv_data,page_id):
         },
         "tvmazeID": {
             "number": tv_id
+        },
+        "Type": {
+            "select": {
+                "name": "TV Serie"
+            }
         },
         "Show Status": {
             "select": {
