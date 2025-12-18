@@ -19,6 +19,7 @@ DATABASE_ID = os.getenv("NOTION_DATABASE_ID")
 USE_PUSHOVER = os.getenv("USE_PUSHOVER", "no")  # Default to 'no' if USE_PUSHOVER is not set
 USE_AWS = os.getenv("USE_AWS", "no")  # Default to 'no' if USE_AWS is not set
 BUCKET = os.getenv("AWS_BUCKET")
+AWS_REGION = os.getenv("AWS_REGION", "us-east-1")  # Default to 'us-east-1' if not set
 
 if USE_AWS.lower() == "yes":
     BUCKET = os.getenv("AWS_BUCKET")
@@ -62,7 +63,7 @@ def upload_file(file_name,object_name):
     if object_name is None:
         object_name = os.path.basename(file_name)
     # Upload the file
-    s3_client = boto3.client('s3')
+    s3_client = boto3.client('s3', region_name=AWS_REGION)
     try:
         response = s3_client.upload_file(file_name, BUCKET, object_name)
         print(response)
@@ -123,9 +124,16 @@ def get_pages(num_pages=None):
     get_all = num_pages is None
     page_size = 100 if get_all else num_pages
     payload = {"page_size": page_size}
+    logging.info(f"Fetching pages from Notion database: {DATABASE_ID}")
     response = requests.post(url, json=payload, headers=NOTION_headers)
     data = response.json()
+
+    if "results" not in data:
+        logging.error(f"Error fetching Notion pages: {data}")
+        return []
+
     results = data["results"]
+    logging.info(f"Found {len(results)} pages in Notion database")
     while data["has_more"] and get_all:
         payload = {"page_size": page_size, "start_cursor": data["next_cursor"]}
         url = f"https://api.notion.com/v1/databases/{DATABASE_ID}/query"
@@ -147,7 +155,7 @@ def new_ep_check():
          last_episode = tv_data['_links']['previousepisode']['href']
          last_episode = last_episode.split("/episodes/")[-1]
          last_episode = int(last_episode)
-         
+
          if last_id != last_episode:
             print("New epsiode of "+title+" is schedule. We need to update!")
             update_tv_data(tv_data,page_id)
@@ -156,25 +164,39 @@ def new_ep_check():
 
 def read_pages():
    pages = get_pages()
+   logging.info(f"Processing {len(pages)} pages from Notion")
+
    for page in pages:
       try:
          page_id = page["id"]
          props = page["properties"]
          title = props["Name"]["title"][0]["text"]["content"]
          tvmazeID = props["tvmazeID"]["number"]
-         # last_id = props["Last Aired Episode"]["number"]
-         #print("TV: ", title, page_id, last_id)
+         logging.info(f"Processing: {title} (tvmazeID: {tvmazeID})")
 
          if tvmazeID is None:
+            logging.info(f"No tvmazeID found for '{title}', searching TVMaze API...")
             new_tv_title = title.replace(';', '')
             new_tv_title = new_tv_title.replace(' ', '+')
             tv_data = get_tv_by_name(new_tv_title)
-            update_tv_data(tv_data,page_id)
+            if tv_data:
+               logging.info(f"Found TV data for '{title}', updating Notion...")
+               update_tv_data(tv_data,page_id)
+            else:
+               logging.warning(f"Could not find TV data for '{title}' on TVMaze")
+         else:
+            logging.info(f"Show '{title}' already has tvmazeID, skipping")
       except KeyError as e:
-         print(f"Error processing page {page['id']}: {e} key not found.")
-         subject = "Error reading data from Notion for "+title
-         message = e
-         send_push(subject,message)
+         logging.error(f"Error processing page {page.get('id', 'unknown')}: {e} key not found.")
+         try:
+            if USE_PUSHOVER.lower() == "yes":
+               subject = f"Error reading data from Notion for {title}"
+               message = str(e)
+               send_push(subject,message)
+         except:
+            pass
+      except Exception as e:
+         logging.error(f"Unexpected error processing page: {e}")
 
 def update_page(page_id: str, data: dict):
     print("Start Update_Page function")
@@ -200,23 +222,27 @@ def update_page(page_id: str, data: dict):
 def make_banner(img_url,page_id):
    # sizing from each image "_V1_SX300."
    img_name = str(page_id+".jpg")
-   urllib.request.urlretrieve(img_url,img_name) 
-   
-   img = Image.open(img_name) 
-   width, height = img.size 
+   poster_name = str(page_id+"_poster.jpg")
+   urllib.request.urlretrieve(img_url,img_name)
+
+   img = Image.open(img_name)
+   width, height = img.size
 
    new_height = 600
    new_width  = new_height * width / height
 
    postersize = (int(new_width), new_height)
    img_poster = img.resize(postersize)
-   # img_poster.show()
+   # Save and upload poster separately
+   img_poster.save(poster_name)
+   if USE_AWS.lower() == "yes":
+      upload_file(poster_name, poster_name)
 
    left = 5
    top = height / 3
    right = width
    bottom = 2 * height / 3
-   
+
    # Cropped image of above dimension
    img = img.crop((left, top, right, bottom))
    newsize = (1500, 600)
@@ -226,9 +252,10 @@ def make_banner(img_url,page_id):
 
    background = img_banner
    foreground = img_poster
-   background.paste(foreground, (514,0)) 
+   background.paste(foreground, (514,0))
    background.save(img_name)
-   upload_file(img_name,img_name)
+   if USE_AWS.lower() == "yes":
+      upload_file(img_name,img_name)
    # background.show()
    return background
 
@@ -256,8 +283,15 @@ def update_tv_data(tv_data,page_id):
       season_count = sum("episodeOrder" in item for item in season_data)
       total_episodes = sum(item["episodeOrder"] for item in season_data if "episodeOrder" in item and item["episodeOrder"] is not None)
       make_banner(img_url,page_id)
-      banner = "https://pipedream-api.s3.us-east-2.amazonaws.com/"+page_id+".jpg"
-      
+
+      # Set URLs based on USE_AWS setting
+      if USE_AWS.lower() == "yes":
+          banner = f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{page_id}.jpg"
+          poster = f"https://{BUCKET}.s3.{AWS_REGION}.amazonaws.com/{page_id}_poster.jpg"
+      else:
+          banner = img_url
+          poster = img_url
+
       # print("Build Notion Update")
       update_data = {
       "cover":{
@@ -296,10 +330,10 @@ def update_tv_data(tv_data,page_id):
             "type":"files",
             "files":[
                {
-                  "name":"Title",
+                  "name":"Poster",
                   "type":"external",
                   "external":{
-                     "url":img_url
+                     "url":poster
                   }
                }
             ]
@@ -335,13 +369,15 @@ def update_tv_data(tv_data,page_id):
       # print("Now Update the page in Notion")
       update_page(page_id,update_data)
       os.remove(page_id+".jpg")
+      if os.path.exists(page_id+"_poster.jpg"):
+          os.remove(page_id+"_poster.jpg")
 
 schedule.every(60).seconds.do(read_pages)
-schedule.every().sunday.do(new_ep_check) 
+schedule.every().sunday.do(new_ep_check)
 logging.info("Next scan scheduled...")
 
 while True:
     schedule.run_pending()
     time.sleep(1)
-    
+
 
